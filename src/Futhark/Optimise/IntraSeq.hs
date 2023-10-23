@@ -134,6 +134,19 @@ seqStm' gid sizes stm@(Let pat aux (Op (SegOp
     isArray (Array {}) = True
     isArray _ = False
 
+
+seqStm' grpId grpSizes (Let pat aux (Op (SegOp (
+          SegMap lvl@(SegThread {}) space ts kbody)))) = do
+
+  let [(tid, _)] = unSegSpace space
+
+  names <- tileSegKernelBody kbody grpSizes grpId (Var tid)
+  let (vNames, tileNames) = unzip names
+
+
+  
+  undefined
+
 seqStm' _ _ _ = undefined
 
 
