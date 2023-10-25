@@ -1,9 +1,3 @@
-{-=# OPTIONS_GHC -Wno-unused-local-binds #-}
-{-# OPTIONS_GHC -Wno-unused-matches #-}
-{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
-{-# HLINT ignore "Use join" #-}
-{-# HLINT ignore "Use list comprehension" #-}
-{-# HLINT ignore "Use null" #-}
 module Futhark.Optimise.IntraSeq (intraSeq) where
 
 import Language.Futhark.Core
@@ -29,7 +23,7 @@ seqFactor = intConst Int64 4
 -- read statements that should be read into a tile
 -- statements used in the given SOAC binops
 -- statements not used in the SOAC lambda body, but have been fused into the kernel body
--- data KBodyStms = KBodyStms { toTile :: [Stm GPU], usedInBinops :: [Stm GPU], fused :: [Stm GPU]}
+data KBodyStms = KBodyStms { toTile :: [Stm GPU], usedInBinops :: [Stm GPU], fused :: [Stm GPU]}
 
 -- NOTE uncomment this for pretty printing AST
 -- intraSeq :: Pass GPU GPU
@@ -122,40 +116,93 @@ seqStm' gid sizes stm@(Let pat aux (Op (SegOp
   (nameMappings, kbodyNotTiled, parNames) <- tileSegKernelBody kbody sizes gid (Var tid)
 
   -- For each BinOp extract the lambda and create a SegMap performing thread local reduction
-  -- TODO: have to update the arguments from the kernelBody to the specific binOp (can you put the binops in the same screma and avoid this??)
-  -- TODO: THIS IS IMPORTANT ELSE MULTIPLE BINOPS WON'T WORK, head is temporary fix
-  redNames <- mapM (mkSegMapRed nameMappings sizes kbodyNotTiled parNames) binops
+  -- TODO: have to update the arguments from the kernelBody to the specific binOp (can you put the binops in the same screma and avoid this?? ie. this should not be a map then)
+  redNames <- mapM (mkSegMapRed nameMappings sizes kbodyNotTiled parNames ts) binops 
+  -- TODO: Head in redNames is temp fix until multiple binops are supported
+  let (newIndexNames, fusedNames) = splitAt (length $ fromNames nameMappings) $ head redNames
 
-  -- -- Update the kbody to use the tile
   let phys = segFlat space
   let [(gtid, _)] = unSegSpace space
   let space' = SegSpace phys [(gtid, snd sizes)]
 
-  -- -- Each VName in fparams should be paired with the corresponding tile
-  -- -- created for the array of that VName
-  -- TODO: Head in redNames is temp fix until multiple binops are supported
-  let kbody' = substituteIndexes kbody $ zip (fromNames nameMappings) $ head redNames
-  addStm $ Let pat aux (Op (SegOp (SegRed lvl space' binops ts kbody')))
-
+  -- Each VName in fparams should be paired with the corresponding tile
+  -- created for the array of that VName
+  let kbody' = updateStms kbody (zip (fromNames nameMappings) newIndexNames) fusedNames (segBinOpResults binops) gtid
+  let (kbody'', ts') = updateKbRes kbody' ts $ segBinOpResults binops
+  let (redPats, mapPats) = splitAt (segBinOpResults binops) $ patElems pat
+  -- let mapPats' = updateFusedTypes mapPats
+  addStm $ Let (Pat redPats) aux (Op (SegOp (SegRed lvl space' binops ts' kbody'')))
 seqStm' _ _ _ = undefined
 
+-- remove unneeded results from kernelbody after sequentialization
+-- removes x results from the kernelbody
+updateKbRes :: KernelBody GPU -> [Type] -> Int -> (KernelBody GPU, [Type])
+updateKbRes (KernelBody dec stms res) ts x = 
+  let res' = take x res
+      ts' = take x ts
+  in (KernelBody dec stms res', ts')
 
-substituteIndexes :: KernelBody GPU -> [(VName, VName)] -> KernelBody GPU
-substituteIndexes (KernelBody dec stms results) names =
-  let stms' = stmsFromList $ map (substituteIndex names) $ stmsToList stms
+
+updateFusedTypes :: [PatElem (TypeBase Shape u)] -> [PatElem (TypeBase Shape u)]
+updateFusedTypes pats = map updateFusedType pats
+
+updateFusedType :: PatElem (TypeBase Shape u) -> PatElem (TypeBase Shape u)
+updateFusedType (PatElem name (Array tp sh u)) = 
+  -- TODO: refactor to use the expandDim helper
+  let newDim = seqFactor
+      dims = shapeDims sh
+      dec' = Array tp (Shape $ dims ++ [newDim]) u
+  in PatElem name dec'
+
+updateFusedType pat = pat
+-- update the stms of the kernelbody to use the indexes of the created tiles (indexNames)
+-- and update any fused statements now processed in a previous screma (fusedNames)
+updateStms :: KernelBody GPU -> [(VName, VName)] -> [VName] -> Int -> VName -> KernelBody GPU
+updateStms (KernelBody dec stms results) indexNames fusedNames numRedRes gtid =
+  let fusedResults = map getVName $ drop numRedRes $ map kernelResultSubExp results
+      fusedMappings = zip fusedResults  fusedNames
+      stms' = stmsFromList $ map (updateStm indexNames fusedMappings gtid) $ stmsToList stms
   in KernelBody dec stms' results
+  where 
+    getVName (Var vName) = vName
+    getVName exp' = error $ "expected SubExp to be of type VName:\n" ++ show exp'
 
-substituteIndex :: [(VName, VName)] -> Stm GPU -> Stm GPU
-substituteIndex names stm@(Let pat aux (BasicOp (Index name slice))) =
-  let (fromNames, toNames) = unzip names
+updateStm :: [(VName, VName)] -> [(VName, VName)] -> VName -> Stm GPU -> Stm GPU
+updateStm indexNames _ _ stm@(Let pat aux (BasicOp (Index name slice))) =
+  let (fromNames, toNames) = unzip indexNames
       index = elemIndex name fromNames
       in case index of
         Just i ->
           -- after tiling we only need the last index
           let slice' = last $ unSlice slice
           in Let pat aux (BasicOp (Index (toNames !! i) $ Slice [slice']))
+        -- TODO: here we want to do what happens in the next updateStm since it could be a slice
         Nothing -> stm
-substituteIndex _ stm = stm
+-- refactor this into its own
+-- updateStm _ fusedNames gtid stm@(Let pat aux _) =
+--   let (fromNames, toNames) = unzip fusedNames
+--   in case patElems pat of
+--     [pe] -> 
+--       let patName = patElemName pe
+--       in case elemIndex patName fromNames of 
+--         Just i -> 
+--           -- TODO: create auxiliary function that appends a seqFactor dim to a patElem dec
+--           let dec' = expandDim (patElemDec pe) seqFactor
+--               pat' = Pat [PatElem patName dec']
+--           in Let pat' aux (BasicOp $ Index (toNames !! i) $ 
+--                         Slice [DimFix $ Var gtid, 
+--                                DimSlice (intConst Int64 0) seqFactor (intConst Int64 1)])
+--         Nothing -> stm
+--     _ -> stm
+updateStm _ _ _ stm = stm 
+-- adds the SubExp as a a new dimension to the given Prim or Arr type
+-- otherwise just return the given type
+expandDim :: TypeBase Shape NoUniqueness -> SubExp -> TypeBase Shape NoUniqueness
+expandDim (Array tp sh u) exp = 
+  let dims = shapeDims sh
+  in Array tp (Shape $ dims ++ [exp]) u
+expandDim (Prim tp) exp = Array tp (Shape [exp]) NoUniqueness
+expandDim tp _ = tp
 
 bindNewGroupSize :: SubExp -> Builder GPU SubExp
 bindNewGroupSize group_size = do
@@ -164,13 +211,14 @@ bindNewGroupSize group_size = do
   pure $ Var name
 
 mkSegMapRed ::
-  TileNameMappings ->                  -- The arrays to reduce over
+  TileNameMappings ->                 -- The arrays to reduce over
   (SubExp, SubExp) ->                 -- (old size, new size)
-  Maybe (Body GPU) ->
-  [VName] ->
-  SegBinOp GPU ->
+  Maybe (Body GPU) ->                 -- body with statements not tiled if any
+  [VName] ->                          -- parameter names for the map part of screma
+  [Type] ->                           -- prim return types for the kernel body
+  SegBinOp GPU ->                     -- segBinOP to create screma over
   Builder GPU [VName]
-mkSegMapRed names grpSizes body parNames binop = do
+mkSegMapRed names grpSizes body parNames kbRetTypes binop = do
   let comm = segBinOpComm binop
   lambda <- renameLambda $ segBinOpLambda binop
   let neutral = segBinOpNeutral binop
@@ -181,11 +229,11 @@ mkSegMapRed names grpSizes body parNames binop = do
       tid <- newVName "tid"
       phys <- newVName "phys_tid"
       currentSize <- mkChunkSize tid $ fst grpSizes
-      es <- mapM (letChunkExp currentSize tid) (tileNames names)
+      inpArrs <- mapM (letChunkExp seqFactor tid) (tileNames names)
       screma <- case body of
         Just k -> buildRedoMapFromKBody [reduce] k
         Nothing -> reduceSOAC [reduce]
-      tmp <- letTupExp' "tmp" $ Op $ OtherOp $ Screma currentSize es screma
+      tmp <- letTupExp' "tmp" $ Op $ OtherOp $ Screma seqFactor inpArrs screma
       let lvl = SegThread SegNoVirt Nothing
       let space = SegSpace phys [(tid, snd grpSizes)]
       let types = scremaType seqFactor screma
@@ -203,9 +251,9 @@ mkSegMapRed names grpSizes body parNames binop = do
       let lamb = Lambda
                 { lambdaParams = params,
                   lambdaBody = body',
-                  lambdaReturnType = ts
+                  lambdaReturnType = kbRetTypes
                 }
-      pTrace (show $ lamb) (pure $ redomapSOAC reds lamb)
+      pure $ redomapSOAC reds lamb
       where
         ts = concatMap (lambdaReturnType . redLambda) reds
 
@@ -283,7 +331,7 @@ mkChunkSize tid sOld = do
 
 
 -- Builds a SegMap at thread level containing all bindings created in m
--- and returns the subExp which is the variable containing the result
+-- and returns the list of subExps containing the results
 buildSegMapThread ::
   String ->
   Builder GPU ([KernelResult], SegLevel, SegSpace, [Type]) ->
@@ -293,7 +341,7 @@ buildSegMapThread name m = do
   let kbody = KernelBody () stms res
   letTupExp' name $ Op $ SegOp $ SegMap lvl space ts kbody
 
--- Like buildSegMapThread but returns the VName instead of the actual 
+-- Like buildSegMapThread but returns the VNames instead of the actual 
 -- SubExp. Just for convenience
 buildSegMapThread_ ::
   String ->
@@ -309,7 +357,8 @@ buildSegMapThread_ name m = do
 
 -- create tiles for the arrays used in the segop kernelbody
 -- returns a list of tuples of the name of the array and its tiled replacement
--- and if any stms were not tiled, the kernelbody with those 
+-- and if any stms were not tiled, the kernelbody with those. Finally a list of 
+-- the parameter names to use in the following screma body (since substitution is done here)
 tileSegKernelBody :: KernelBody GPU -> (SubExp, SubExp) -> SubExp -> SubExp
                       -> Builder GPU (TileNameMappings, Maybe (Body GPU), [VName])
 tileSegKernelBody kb@(KernelBody dec stms res) grpSizes gid tid = do
@@ -346,12 +395,12 @@ tileSegKernelBody kb@(KernelBody dec stms res) grpSizes gid tid = do
         updateAcc :: Bool -> ([Stm GPU], [Stm GPU])
         updateAcc b = if b then (stm:toTile, dontTile) else (toTile, stm:dontTile)
     shouldTile stm (toTile, dontTile) = (toTile, stm:dontTile)
-      
+
     getStmSingleName :: Stm GPU -> VName
-    getStmSingleName stm@(Let pat _ _) = 
-      case patElems pat of 
+    getStmSingleName stm@(Let pat _ _) =
+      case patElems pat of
       [pe] -> patElemName pe
-      _ -> error $ "Expected a let binding for a single VName:\n" ++ show stm 
+      _ -> error $ "Expected a let binding for a single VName:\n" ++ show stm
 
     getTileStmInfo :: Stm GPU -> ArrInfo
     getTileStmInfo stm@(Let pat _ (BasicOp (Index name slice))) =
@@ -366,14 +415,17 @@ tileSegKernelBody kb@(KernelBody dec stms res) grpSizes gid tid = do
       error
         $ "Invalid statement for tiling in IntraSeq " ++ show stm
 
+-- getBinopsArity :: [SegBinOp GPU] -> Int
+-- getBinopsArity binops = foldl (\acc b -> acc + getArity b) 0 binops
+--   where
+--     getArity :: SegBinOp GPU -> Int
+--     getArity (SegBinOp _ (Lambda pars _ _) neut _) =
+--       length pars - length neut
+
 -- analyseSoacKBodyStms :: KernelBody GPU -> [SegBinOp GPU] -> KBodyStms
 -- analyseSoacKBodyStms kbody binops = 
---   let arity = foldl (+) $ map getArity binops
+--   let arity = getBinopsArity binops
 
 --   in undefined
 --   -- length segBinOpNeutral, segbinoplambda -> length lambdaParams
---   where
---     getArity :: SegBinOp GPU -> Int
---     getArity (SegBinOp _ lamb neut _) = 
---       length lamb + length (lambdaParams lamb)
 
