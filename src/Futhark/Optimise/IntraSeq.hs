@@ -302,11 +302,11 @@ seqStm' env (Let pat aux
 --       tileFlat <- letExp "flat" $ BasicOp $ Reshape ReshapeArbitrary (Shape [size]) arr'
 --       let slice' = Slice $ tail $ unSlice slice
 --       addStm $ Let pat aux (BasicOp (Index tileFlat slice'))
-  
+
 
 -- Catch all
 seqStm' _ stm = addStm stm
-                
+
 
 seqScatter :: Env -> Stm GPU -> Builder GPU ()
 seqScatter env (Let pat aux (Op (SegOp
@@ -314,7 +314,7 @@ seqScatter env (Let pat aux (Op (SegOp
 
   -- Create the Loop expression
   let dests = L.map (\(WriteReturns _ dest _ ) -> dest) (kernelBodyResult kbody)
-  loopInit <- 
+  loopInit <-
       forM dests $ \d -> do
           tp <- lookupType d
           let decl = toDecl tp Unique
@@ -336,7 +336,7 @@ seqScatter env (Let pat aux (Op (SegOp
           size' <- letSubExp "size'" =<< eBinOp (Sub Int64 OverflowUndef)
                                                 (eSubExp size)
                                                 (eSubExp $ intConst Int64 1)
-          i' <- letExp "loop_i'" $ BasicOp $ 
+          i' <- letExp "loop_i'" $ BasicOp $
                                  BinOp (SMin Int64) size' (Var i)
 
           -- Modify original statements
@@ -368,7 +368,7 @@ seqScatter env (Let pat aux (Op (SegOp
           -- let res' = L.map (Returns ResultMaySimplify mempty) updates
           pure (res', lvl', space', ts)
 
-      
+
       -- Return the results from the segmap from the loop
       let res = L.map (SubExpRes mempty) mapRes
       pure res
@@ -377,7 +377,7 @@ seqScatter env (Let pat aux (Op (SegOp
   let loopExp = Loop loopInit loopForm body
 
   addStm $ Let pat aux loopExp
-  
+
   -- End
   pure ()
   where
@@ -485,39 +485,66 @@ mkIntmRed ::
   [SegBinOp GPU] ->
   Builder GPU [VName]
 mkIntmRed env kbody retTs binops = do
-    let ne   = L.map segBinOpNeutral binops
-    lambda <- mapM (renameLambda . segBinOpLambda) binops
 
     buildSegMapTup_ "red_intermediate" $ do
       tid <- newVName "tid"
       let env' = updateEnvTid env tid
+      let numRes = numArgsConsumedBySegop binops
       phys <- newVName "phys_tid"
       sz <- mkChunkSize tid env
       usedArrs <- getUsedArraysIn env kbody
       lambSOAC <- buildSOACLambda env' usedArrs kbody retTs
       -- TODO analyze if any fused maps then produce reduce?
       -- we build the reduce as a scan initially
-      let scans = L.map (\(l, n) -> Scan l n) $ zip lambda ne
-      let screma = scanomapSOAC scans lambSOAC
       chunks <- mapM (getChunk env tid (seqFactor env)) usedArrs
+      res' <- if hasPreprocessing kbody numRes then mkScanomap lambSOAC sz chunks numRes
+              else mkRedomap lambSOAC chunks numRes
+      let lvl' = SegThread SegNoVirt Nothing
+      let space' = SegSpace phys [(tid, grpSize env)]
+      let kres = L.map (Returns ResultMaySimplify mempty) res'
+      types' <- mapM subExpType res'
+      pure (kres, lvl', space', types')
 
+  where
+    mkScanomap :: Lambda GPU -> SubExp -> [VName] -> Int -> Builder GPU [SubExp]
+    mkScanomap lambSOAC sz chunks resConsumed = do
+      let ne   = L.map segBinOpNeutral binops
+      lambdas <- mapM (renameLambda . segBinOpLambda) binops
+      let scans = L.map (\(l, n) -> Scan l n) $ zip lambdas ne
+      let screma = scanomapSOAC scans lambSOAC 
       res <- letTupExp' "res" $ Op $ OtherOp $
                 Screma (seqFactor env) chunks screma
-      let numRes = numArgsConsumedBySegop binops
-      let (scanRes, mapRes) = L.splitAt numRes res
-
+      let (scanRes, mapRes) = L.splitAt resConsumed res
       -- get the reduction result from the scan
       redIndex <- letSubExp "red_index" =<< eBinOp (Sub Int64 OverflowUndef)
                                                    (eSubExp sz)
                                                    (eSubExp $ intConst Int64 1)
       redRes <- forM scanRes
             (\r -> letSubExp "red_res" $ BasicOp $ Index (getVName r) (Slice [DimFix redIndex]))
-      let res' = redRes ++ mapRes
-      let lvl' = SegThread SegNoVirt Nothing
-      let space' = SegSpace phys [(tid, grpSize env)]
-      let kres = L.map (Returns ResultMaySimplify mempty) res'
-      types' <- mapM subExpType res'
-      pure (kres, lvl', space', types')
+      pure $ redRes ++ mapRes
+
+    mkRedomap :: Lambda GPU -> [VName] -> Int -> Builder GPU [SubExp]
+    mkRedomap lambSOAC chunks resConsumed = do
+      -- TODO: can give incorrect for odd sizes
+      let ne   = L.map segBinOpNeutral binops
+      let comms = L.map segBinOpComm binops
+      lambdas <- mapM (renameLambda . segBinOpLambda) binops
+      let reds = L.map (\(l, (c, n)) -> Reduce c l n) $ zip lambdas $ zip comms ne
+      let screma = redomapSOAC reds lambSOAC
+      res <- letTupExp' "res" $ Op $ OtherOp $
+                Screma (seqFactor env) chunks screma
+      let (redRes, mapRes) = L.splitAt resConsumed res
+      pure $ redRes ++ mapRes
+
+hasPreprocessing :: KernelBody GPU -> Int -> Bool
+hasPreprocessing (KernelBody _ _ res) argsConsumed =
+  any (\r ->
+        case kernelResultSubExp r of
+          Constant _ -> False
+          -- TODO little hacky
+          Var n -> isInfixOf "lifted_lambda" $ baseString n
+      ) $ L.take argsConsumed res
+
 
 getUsedArraysIn ::
   Env ->
@@ -629,7 +656,7 @@ mkTiles ::
 mkTiles env = do
   scope <- askScope
   let arrsInScope = M.toList $ M.filter isArray scope
-  
+
   tileSize <- letSubExp "tile_size" =<< eBinOp (Mul Int64 OverflowUndef)
                                                (eSubExp $ seqFactor env)
                                                (eSubExp $ grpSize env)
@@ -647,11 +674,11 @@ mkTiles env = do
                       Index arrName (Slice $ outerDim ++ [sliceIdx])
 
     tileStaging <- letExp "tile_staging" $ BasicOp $
-                      Update Unsafe tileScratch 
-                        (Slice [DimSlice (intConst Int64 0) 
-                                         (grpsizeOld env) 
+                      Update Unsafe tileScratch
+                        (Slice [DimSlice (intConst Int64 0)
+                                         (grpsizeOld env)
                                          (intConst Int64 1)]
-                        ) tileSlice 
+                        ) tileSlice
 
     -- Now read the chunks using a segmap
     let (VName n _) = arrName
@@ -670,12 +697,12 @@ mkTiles env = do
       let types = [Array tp (Shape [seqFactor env]) NoUniqueness]
       let res = [Returns ResultPrivate mempty chunk]
       pure (res, lvl, space, types)
-    
+
 
     pure (arrName, tile)
 
   pure $ setMapping env (M.fromList tiles)
-  
+
 -- mkTiles ::
 --   Env ->
 --   Builder GPU Env
@@ -687,7 +714,7 @@ mkTiles env = do
 --                                                (eSubExp $ seqFactor env)
 --                                                (eSubExp $ grpSize env)
 
- 
+
 --   tiles <- forM arrsInScope $ \ (arrName, arrInfo) -> do
 --     let tp = elemType $ typeOf arrInfo
 
@@ -710,7 +737,7 @@ mkTiles env = do
 --       sliceSize <- letSubExp "slice_size" =<< eBinOp (SDivUp Int64 Unsafe)
 --                                                      (eSubExp tmp)
 --                                                      (eSubExp $ grpSize env)
-      
+
 --       let outerDim = ([DimFix $ grpId env | arrayRank (typeOf arrInfo) > 1])
 --       let sliceIdx = DimSlice (Var tid) sliceSize (grpSize env)
 --       vals <- letSubExp "slice" $ BasicOp $ Index arrName
@@ -731,7 +758,7 @@ mkTiles env = do
 --       --                                       (eSubExp $ grpSize env)
 --       let slice = Slice [DimSlice (Var tid) (seqFactor env) (grpSize env)]
 --       let res = [WriteReturns mempty scratch [(slice, chunk')]]
-      
+
 --       pure (res, lvl, space, types)
 
 --     -- transpose and flatten
