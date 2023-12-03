@@ -89,6 +89,7 @@ gpuPipeline =
     >>> onePass extractKernels
     >>> passes
       -- [ simplifyGPU,
+      --   intraSeq,
       --   optimiseGenRed,
       --   simplifyGPU,
       --   tileLoops,
@@ -106,23 +107,24 @@ gpuPipeline =
       --   mergeGPUBodies,
       --   simplifyGPU, -- Cleanup merged GPUBody kernels.
       --   sinkGPU, -- Sink reads within GPUBody kernels.
-      --   inPlaceLoweringGPU,
-      --   intraSeq
+      --   inPlaceLoweringGPU
+      --   -- intraSeq,
+      --   -- unstreamGPU
       -- ]
-      [ simplifyGPU,
-        intraSeq,
-        unstreamGPU,
-        simplifyGPU
-      ]
+      -- [ simplifyGPU,
+      --   intraSeq,
+      --   unstreamGPU,
+      --   simplifyGPU
+      -- ]
       -- [
       --   simplifyGPU,
       --   intraSeq,
       --   simplifyGPU
       -- ]
-      -- [
-      --   simplifyGPU,
-      --   intraSeq
-      -- ]
+      [
+        simplifyGPU,
+        intraSeq
+      ]
 
 -- | The pipeline used by the sequential backends.  Turns all
 -- parallelism into sequential loops.  Includes 'standardPipeline'.

@@ -266,19 +266,67 @@ seqStm' env (Let pat aux
       let tid = fst $ head $ unSegSpace space
       let env' = updateEnvTid env tid
 
-      -- thread local reduction
-      reds <- lift $ do mkIntmRed env' kbody ts binops
-      kbody' <- lift $ do mkResultKBody env' kbody reds
+      -- Transform the SegBinOps such that they take chunks as arguemnts
+      -- instead of scalar. The neutral element is still a scalar
+      binops' <- forM binops $ \ bop@(SegBinOp comm lambda neut shape) -> do
+          let (Lambda pars tps body) = lambda
+          let (nePars, inPars) = L.splitAt (segBinOpResults [bop]) pars
+          inPars' <- mapM (\ (Param pattrs pname pdec) -> lift $ do
+                                    let pdec' = arrayOfRow pdec (seqFactor env)
+                                    pure $ Param pattrs pname pdec'
+                              ) inPars
 
-      -- Update existing SegRed 
-      let numResConsumed = numArgsConsumedBySegop binops
+          let pars' = nePars <> inPars'
+
+          let (Body bdec _ bres) = body
+          innerLam <- renameLambda $ Lambda pars tps body
+          let reduce = Reduce comm innerLam neut
+          -- mapLam :: Lambda GPU <- mkIdentityLambda $ L.map paramDec inPars'
+          -- let scremaForm = redomapSOAC [reduce] mapLam
+          scremaForm <- reduceSOAC [reduce]
+
+          let screma = Screma (seqFactor env) (L.map paramName inPars') scremaForm
+
+          -- body' :: Body GPU <- lift $ runBodyBuilder $ do
+          --     inter <- letSubExp "intermediate" $ Op $ OtherOp screma
+          --     pure $ mkBodyM 
+
+          (bres', bstms') <- collectSeqBuilder $ do
+              inter <- lift $ do letSubExp "inter"$ Op $ OtherOp screma 
+              pure [SubExpRes mempty inter]
+
+          let body' = Body bdec bstms' bres'
+
+              
+
+          -- let tmp = Let pat aux (Op (OtherOp screma))
+          -- let body' = Body bdec (stmsFromList [tmp]) bres  
+          
+
+          let lambda' = Lambda pars' tps body'
+          pure $ SegBinOp comm lambda' neut shape
+
+      kbody' <- do
+            let (KernelBody kdec kstms kres) = kbody
+            kstms' <- lift $ do runSeqMExtendedScope (seqStms'' env' kstms) mempty
+            pure $ KernelBody kdec kstms' kres
+
       let space' = SegSpace (segFlat space) [(tid, grpSize env')]
-      tps <- mapM lookupType reds
-      let ts' = L.map (stripArray 1) tps
-      let (patKeep, patUpdate) = L.splitAt numResConsumed $ patElems pat
-      let pat' = Pat $ patKeep ++
-            L.map (\(p, t) -> setPatElemDec p t) (L.zip patUpdate (L.drop numResConsumed tps))
-      lift $ do addStm $ Let pat' aux (Op (SegOp (SegRed lvl space' binops ts' kbody')))
+      lift $ do addStm $ Let pat aux (Op (SegOp (SegRed lvl space' binops' ts kbody')))
+
+      -- thread local reduction
+      -- reds <- lift $ do mkIntmRed env' kbody ts binops
+      -- kbody' <- lift $ do mkResultKBody env' kbody reds
+
+      -- -- Update existing SegRed 
+      -- let numResConsumed = numArgsConsumedBySegop binops
+      -- let space' = SegSpace (segFlat space) [(tid, grpSize env')]
+      -- tps <- mapM lookupType reds
+      -- let ts' = L.map (stripArray 1) tps
+      -- let (patKeep, patUpdate) = L.splitAt numResConsumed $ patElems pat
+      -- let pat' = Pat $ patKeep ++
+      --       L.map (\(p, t) -> setPatElemDec p t) (L.zip patUpdate (L.drop numResConsumed tps))
+      -- lift $ do addStm $ Let pat' aux (Op (SegOp (SegRed lvl space' binops ts' kbody')))
 
 seqStm' env stm@(Let pat _ (Op (SegOp
           (SegMap lvl@(SegThread {}) space ts kbody))))
@@ -666,7 +714,13 @@ seqStm'' env (Let pat aux (BasicOp (Index arr _)))
   | memberMapping env arr = do
   let (Just name) = lookupMapping env arr
   i <- getTidIndexExp env name
-  addStm $ Let pat aux i
+  -- upadte the type of pat
+  let (Pat pelms) = pat
+  let (pnames, pdecs) = L.unzip $ L.map (\(PatElem n d) -> (n,d)) pelms
+  let pdecs' = L.map (\pd -> arrayOfRow pd (seqFactor env)) pdecs
+  let pat' = Pat $ L.map (\(n,d) -> PatElem n d) (L.zip pnames pdecs')
+
+  addStm $ Let pat' aux i
 
 seqStm'' env stm = do
   let tid = getThreadId env
