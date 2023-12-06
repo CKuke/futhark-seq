@@ -152,7 +152,7 @@ intraSeq :: Pass GPU GPU
 intraSeq =
     Pass "name" "description" $
       intraproceduralTransformation onStms
-        -- >=> simplifyGPU
+        >=> simplifyGPU
     where
       onStms scope stms =
         modifyNameSource $
