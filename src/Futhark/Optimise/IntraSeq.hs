@@ -399,8 +399,10 @@ seqStm' env (Let pat aux
         let scanParams' = L.map (\(n,s) -> L.take (L.length n) s) $ L.zip nes scanParams
         let nesMap = M.fromList $ L.zip (concat scanParams') (L.map getVName $ concat nes)
         let scan = singleScan . L.map (\(l, n) -> Scan l n) $ L.zip scanLambdas nes
-        let lamb = substituteNames nesMap $ scanLambda scan
-
+        let (Lambda p r b) = scanLambda scan
+        let lambB = pTrace(show nesMap) substituteNames nesMap b
+        let lambP = L.drop 1 p
+        let lamb = Lambda lambP r lambB 
         let tidMap = M.singleton tid tid'
         let kbody' = substituteNames tidMap kbody
         iot <- buildSeqFactorIota env
@@ -409,7 +411,7 @@ seqStm' env (Let pat aux
         -- let scanSoac = scanomapSOAC scans lambSOAC
         let mapSoac = mapSOAC lamb
         es <- mapM (getChunk env'') imScan
-        res <- letTupExp' "res" $ Op $ OtherOp $ Screma (seqFactor env) (es ++ [iot]) mapSoac
+        res <- letTupExp' "res" $ Op $ OtherOp $ Screma (seqFactor env) es mapSoac
         let usedRes = L.map (Returns ResultMaySimplify mempty) $ L.take numResConsumed res
         fused <- mapM (buildKernelResult env'') fusedRes
 
