@@ -152,7 +152,7 @@ intraSeq :: Pass GPU GPU
 intraSeq =
     Pass "name" "description" $
       intraproceduralTransformation onStms
-        >=> simplifyGPU
+        -- >=> simplifyGPU
     where
       onStms scope stms =
         modifyNameSource $
@@ -310,23 +310,70 @@ seqStm' env (Let pat aux
   | otherwise = do
       usedArrays <- lift $ do getUsedArraysIn env kbody
 
-      -- do local reduction
       let tid = fst $ head $ unSegSpace space
       let env' = updateEnvTid env tid
-      reds <- lift $ do mkIntmRed env' kbody ts binops
+      -- reds <- lift $ do mkIntmRed env' kbody ts binops
+
+      -- intermediate scan
+      imScan <- lift . buildSegMapTup_ "scan_registers" $ do
+        lambda <- mapM (renameLambda . segBinOpLambda) binops
+        let ne = L.map segBinOpNeutral binops
+        tid' <- newVName "tid"
+        let env'' = updateEnvTid env tid'
+        phys <- newVName "phys_tid"
+        let tidMap = M.singleton (getThreadId env') tid'
+        -- need to update kbody to use tid'
+        let kbody' = substituteNames tidMap kbody
+        -- any stm using the old tid must now use 
+        -- (tid' * local index of element being processed sequentially)
+        iot <- buildSeqFactorIota env'
+        lambSOAC <- buildSOACLambda env'' usedArrays iot kbody' ts
+        let scans = L.map (\(l, n) -> Scan l n) $ L.zip lambda ne
+        let screma = scanomapSOAC scans lambSOAC
+        chunks <- mapM (getChunk env'') usedArrays
+        res <- letTupExp' "res" $ Op $ OtherOp $
+                Screma (seqFactor env) (chunks ++ [iot]) screma
+        -- let numRes = numArgsConsumedBySegop binops
+        -- let (scanRes, mapRes) = L.splitAt numRes res
+        let lvl' = SegThread SegNoVirt Nothing
+        let space' = SegSpace phys [(tid', grpSize env)]
+        let kres = L.map (Returns ResultMaySimplify mempty) res
+        types' <- mapM subExpType res
+        pure (kres, lvl', space', types')
+
+
+
       let numResConsumed = numArgsConsumedBySegop binops
-      let (scanReds, fusedReds) = L.splitAt numResConsumed reds
+      let (scanRes, fusedRes) = L.splitAt numResConsumed imScan
+      -- do local reduction
+      -- let tid = fst $ head $ unSegSpace space
+      -- let env' = updateEnvTid env tid
+      -- reds <- lift $ do mkIntmRed env' kbody ts binops
+      -- let numResConsumed = numArgsConsumedBySegop binops
+      -- let (scanReds, fusedReds) = L.splitAt numResConsumed reds
 
       -- scan over reduction results
-      imScan <- lift . buildSegScan "scan_agg" $ do
+      imScan' <- lift . buildSegScan "scan_agg" $ do
         tid' <- newVName "tid"
+        sz <- mkChunkSize tid' env
         let env'' = updateEnvTid env tid'
         phys <- newVName "phys_tid"
         binops' <- renameSegBinOp binops
 
         let lvl' = SegThread SegNoVirt Nothing
         let space' = SegSpace phys [(tid', grpSize env'')]
-        results <- mapM (buildKernelResult env'') scanReds
+        redIndex <- letSubExp "red_index" =<< eBinOp (Sub Int64 OverflowUndef)
+                                                     (eSubExp sz)
+                                                     (eSubExp $ intConst Int64 1)
+        redRes <- forM scanRes (\r -> do
+            rType <- lookupType r
+            let rDims = L.tail $ arrayDims rType
+            let innerDims = L.map (\d -> DimSlice (intConst Int64 0) d (intConst Int64 1)) rDims
+            let newDims = DimFix redIndex : innerDims
+            letExp "red_res" $ BasicOp $ Index r (Slice newDims)
+            )
+
+        results <- mapM (buildKernelResult env'') redRes
         let ts' = L.take numResConsumed ts
         pure (results, lvl', space', binops', ts')
 
@@ -337,7 +384,7 @@ seqStm' env (Let pat aux
         let neutrals = L.map segBinOpNeutral binops
         scanLambdas <- mapM (renameLambda . segBinOpLambda) binops
 
-        let scanNames = L.map getVName imScan
+        let scanNames = L.map getVName imScan'
 
         idx <- letSubExp "idx" =<< eBinOp (Sub Int64 OverflowUndef)
                                         (eSubExp $ Var tid')
@@ -348,24 +395,29 @@ seqStm' env (Let pat aux
                                    )
                                    (eBody $ L.map toExp n)
                                      (eBody $ L.map (\s -> eIndex s [eSubExp idx]) scanNames))
+        let scanParams = mapM (L.map (identName . paramIdent) . lambdaParams) scanLambdas
+        let scanParams' = L.map (\(n,s) -> L.take (L.length n) s) $ L.zip nes scanParams
+        let nesMap = M.fromList $ L.zip (concat scanParams') (L.map getVName $ concat nes)
+        let scan = singleScan . L.map (\(l, n) -> Scan l n) $ L.zip scanLambdas nes
+        let lamb = substituteNames nesMap $ scanLambda scan
 
         let tidMap = M.singleton tid tid'
         let kbody' = substituteNames tidMap kbody
         iot <- buildSeqFactorIota env
         let env'' = updateEnvTid env tid'
         lambSOAC <- buildSOACLambda env'' usedArrays iot kbody' ts
-        let scans = L.map (\(l, n) -> Scan l n) $ L.zip scanLambdas nes
-        let scanSoac = scanomapSOAC scans lambSOAC
-        es <- mapM (getChunk env'') usedArrays
-        res <- letTupExp' "res" $ Op $ OtherOp $ Screma (seqFactor env) (es ++ [iot]) scanSoac
+        -- let scanSoac = scanomapSOAC scans lambSOAC
+        let mapSoac = mapSOAC lamb
+        es <- mapM (getChunk env'') imScan
+        res <- letTupExp' "res" $ Op $ OtherOp $ Screma (seqFactor env) (es ++ [iot]) mapSoac
         let usedRes = L.map (Returns ResultMaySimplify mempty) $ L.take numResConsumed res
-        fused <- mapM (buildKernelResult env'') fusedReds
+        fused <- mapM (buildKernelResult env'') fusedRes
 
         let lvl' = SegThread SegNoVirt Nothing
         let space' = SegSpace phys [(tid', grpSize env)]
-        let types' = scremaType (seqFactor env) scanSoac
+        let types' = scremaType (seqFactor env) mapSoac
         pure (usedRes ++ fused, lvl', space', types')
-      
+
       tps <- mapM lookupType scans'
       let shapes = L.map arrayShape tps
       let shapes' = L.map (\s -> setOuterDims s 2 (Shape [grpsizeOld env])) shapes
@@ -627,7 +679,7 @@ getTidIndexExp env name = do
           0 -> SubExp $ Var name
           1 -> Index name $ Slice outerDim
           _ -> do
-            let dims = L.tail $ arrayDims tp 
+            let dims = L.tail $ arrayDims tp
             let innerDims = L.map (\d -> DimSlice (intConst Int64 0) d (intConst Int64 1)) dims
             let allDims = outerDim ++ innerDims
             Index name $ Slice allDims
