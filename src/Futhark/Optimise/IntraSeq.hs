@@ -450,9 +450,19 @@ seqStm' env (Let pat aux (Loop header form body)) = do
   lift $ do addStm $ Let pat aux (Loop header form body')
 
 
+seqStm' env (Let pat aux (BasicOp (Index arr _)))
+  | memberMapping env arr = do
+    let [tp] = patTypes pat
+    let shape = arrayShape tp
+    let (Just name) = lookupMapping env arr
+    reshaped <- lift $ letSubExp "reshaped" $ BasicOp $ Reshape ReshapeArbitrary shape name
+    lift $ do addStm $ Let pat aux (BasicOp $ SubExp reshaped)
+  
 
 -- Catch all
 seqStm' _ stm = lift $ do addStm stm
+
+
 
 -- Update types of pat to match the return types of an intermediate SegOp 
 -- first keep patterns will not be changed
@@ -882,6 +892,8 @@ mkTiles ::
 mkTiles env = do
   scope <- askScope
   let arrsInScope = M.toList $ M.filter isArray scope
+
+  -- let !_ = pTrace (show arrsInScope) ()
 
   tileSize <- lift $ do letSubExp "tile_size" =<< eBinOp (Mul Int64 OverflowUndef)
                                                (eSubExp $ seqFactor env)
